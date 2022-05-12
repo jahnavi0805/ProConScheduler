@@ -1,0 +1,149 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: fileserver
+spec:
+  capacity:
+    storage: 1T
+  accessModes:
+  - ReadWriteMany
+  nfs:
+    path: /vol1
+    server: 10.0.0.2
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: ""
+  volumeName: fileserver
+  resources:
+    requests:
+      storage: 1G
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: test
+spec:
+  selector:
+    matchLabels:
+      name: test
+  template:
+    metadata:
+      labels:
+        name: test
+    spec:
+      tolerations:
+      - key: node-role.kubernetes.io/node
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: test
+        image: ubuntu:18.04
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: MY_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName   
+        - name: MY_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace     
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlogcontainers
+          mountPath: /var/log/containers
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+        - name: vartmp
+          mountPath: /var/tmp
+        - name: etc
+          mountPath: /etc/machine-id
+        - name: syscpu
+          mountPath: /sys/fs/cgroup/cpu/
+        - name: volume
+          mountPath: /var/tmp/logs/
+        command:
+        - /bin/bash
+        - -c
+        - |   
+          declare -A pod_stats
+          declare -A pod_prev_iter
+          declare -A pod_prev_iter_time 
+          while true;
+          do
+            node_name="$(printenv MY_NODE_NAME)"
+            outFile="/var/tmp/logs/$node_name.txt"
+            if [ -f "$outFile" ] ; then
+              rm "$outFile"
+            fi
+            cat > $outFile            
+            cd /var/log/containers
+            for file in *.log; 
+            do 
+              if [[ "$file" == *"kube-system"* ]] || [[ "$file" == *"test"* ]]
+              then
+                  continue
+              else                
+                line=$( tail -n 1 $file )     
+                line=`echo $line | sed 's/ *$//g'`  
+                n=0
+                while read -n1 character; do
+                    n=$((n+1)); 
+                done < <(echo -n "$line")
+                if [[ $n != 0 ]] && [[ $line == *"Epoch"* ]]; then                        
+                  current_iter=$(echo $line | cut -d , -f 1 | cut -d " " -f 5| cut -d / -f 1)
+                  max_iter=$(echo $line | cut -d , -f 1 | cut -d " " -f 5| cut -d / -f 2)
+                  temp=`expr $current_iter - 1`
+                  if [[ -n "${pod_prev_iter["$file"]:-}" ]]; then
+                    if [[ $temp == ${pod_prev_iter["$file"]} ]]; then
+                      pod_prev_iter["$file"]=$current_iter
+                      current_time=$(date +"%s")
+                      prev_time=${pod_prev_iter_time["$file"]}
+                      remaining_iter=$((max_iter-current_iter))
+                      time_diff=$((current_time-prev_time))
+                      pod_stats["$file"]=$((remaining_iter*time_diff))
+                      pod_prev_iter_time["$file"]=$current_time
+                    fi
+                  else
+                    pod_prev_iter["$file"]=$current_iter
+                    pod_prev_iter_time["$file"]=$(date +"%s")
+                    remaining_iter=$((max_iter-current_iter))
+                    pod_stats["$file"]=$((remaining_iter*10000))
+                  fi                  
+                fi
+              fi
+            done
+            for key in "${!pod_stats[@]}"; do
+              echo "$key:${pod_stats[$key]}" >> $outFile
+            done          
+            sleep 100;
+          done
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: syscpu
+        hostPath:
+          path: /sys/fs/cgroup/cpu/
+      - name: etc
+        hostPath:
+          path: /etc/machine-id
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: varlogcontainers
+        hostPath:
+          path: /var/log/containers
+      - name: vartmp
+        hostPath:
+          path: /var/tmp
+      - name: volume
+        persistentVolumeClaim:
+          claimName: my-pvc
